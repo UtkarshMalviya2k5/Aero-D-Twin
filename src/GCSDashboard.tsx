@@ -1,353 +1,947 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 
 interface Telemetry {
-  rpm: number; map: number; fuelFlow: number; oilPressure: number; oilTemp: number;
-  cht: number[]; egt: number[]; vibration: number; altitude: number; throttle: number; missionTime: number;
-}
-interface PhysicsBaseline { expectedCHT: number[]; expectedEGT: number[]; expectedOilTemp: number; expectedFuelFlow: number; }
-interface Residuals { cht: number[]; egt: number[]; oilTemp: number; fuelFlow: number; }
-interface Fault { id: string; severity: "CRITICAL" | "CAUTION" | "ADVISORY"; code: string; description: string; cylinder?: number; timestamp: string; }
-interface HealthIndex { overall: number; cylinder: number[]; lubrication: number; combustion: number; thermal: number; rulHours: number; }
-
-function computePhysicsBaseline(t: Telemetry): PhysicsBaseline {
-  const rpmF = t.rpm / 2700, mapF = t.map / 101.3;
-  const bCHT = 135 + rpmF * 80 + mapF * 30, bEGT = 650 + rpmF * 150 + mapF * 60;
-  return {
-    expectedCHT: [bCHT, bCHT + 2, bCHT - 1, bCHT + 3],
-    expectedEGT: [bEGT, bEGT - 5, bEGT + 8, bEGT - 3],
-    expectedOilTemp: 85 + rpmF * 25,
-    expectedFuelFlow: 8.2 + rpmF * 6.4 * mapF,
-  };
-}
-function computeResiduals(t: Telemetry, b: PhysicsBaseline): Residuals {
-  return { cht: t.cht.map((v, i) => v - b.expectedCHT[i]), egt: t.egt.map((v, i) => v - b.expectedEGT[i]), oilTemp: t.oilTemp - b.expectedOilTemp, fuelFlow: t.fuelFlow - b.expectedFuelFlow };
+  rpm: number;
+  map: number;
+  fuelFlow: number;
+  oilPressure: number;
+  oilTemp: number;
+  cht: number[];
+  egt: number[];
+  vibration: number;
+  altitude: number;
+  throttle: number;
+  missionTime: number;
+  injectionTiming: number;
+  ambientTemp: number;
 }
 
-const deg = { cyl2: 0, cyl4: 0, oil: 0 };
-
-function generateTelemetry(tick: number, seed: number): Telemetry {
-  const t = tick * 0.5;
-  const rpm = 2400 + Math.sin(t * 0.03) * 80 + (Math.random() - 0.5) * 20;
-  const mapPa = 95 + Math.sin(t * 0.02) * 8;
-  deg.cyl2 = Math.min(1, tick * 0.0004 + (seed > 0.5 ? tick * 0.0008 : 0));
-  deg.cyl4 = Math.min(1, tick * 0.0003);
-  deg.oil   = Math.min(1, tick * 0.00025 + (seed > 0.7 ? tick * 0.0006 : 0));
-  const bRPM = rpm / 2700, bCHT = 138 + bRPM * 78, bEGT = 658 + bRPM * 145;
-  return {
-    rpm: Math.round(rpm), map: mapPa,
-    fuelFlow: 11.4 + bRPM * 5.8 + deg.cyl4 * 1.8 + (Math.random() - 0.5) * 0.3,
-    oilPressure: Math.max(180, 340 - deg.oil * 120 + (Math.random() - 0.5) * 8),
-    oilTemp: 88 + bRPM * 22 + deg.oil * 18 + (Math.random() - 0.5) * 1.5,
-    cht: [bCHT + (Math.random() - 0.5) * 3, bCHT + deg.cyl2 * 55 + (Math.random() - 0.5) * 4, bCHT - 2 + (Math.random() - 0.5) * 3, bCHT + deg.cyl4 * 20 + (Math.random() - 0.5) * 4],
-    egt: [bEGT + (Math.random() - 0.5) * 8, bEGT + deg.cyl2 * 42 + (Math.random() - 0.5) * 10, bEGT - 6 + (Math.random() - 0.5) * 8, bEGT - deg.cyl4 * 28 + (Math.random() - 0.5) * 10],
-    vibration: 0.08 + deg.cyl2 * 0.18 + deg.cyl4 * 0.12 + (Math.random() - 0.5) * 0.02,
-    altitude: 3200 + Math.sin(t * 0.008) * 400,
-    throttle: 72 + Math.sin(t * 0.015) * 12,
-    missionTime: tick * 0.5,
-  };
+interface PhysicsBaseline {
+  expectedCHT: number[];
+  expectedEGT: number[];
+  expectedOilTemp: number;
+  expectedOilPress: number;
+  expectedFuelFlow: number;
+  expectedCombustionEff: number;
+  observedCombustionEff: number;
+  efficiencyResidual: number;
 }
 
-function detectFaults(t: Telemetry, r: Residuals): Fault[] {
-  const faults: Fault[] = [];
-  const ts = new Date().toISOString().substr(11, 8);
-  if (r.cht[1] > 28) faults.push({ id: "F001", severity: r.cht[1] > 45 ? "CRITICAL" : "CAUTION", code: "CHT-C2-HIGH", description: "Cylinder 2 thermal anomaly — cooling duct restriction suspected", cylinder: 2, timestamp: ts });
-  if (deg.oil > 0.35) faults.push({ id: "F002", severity: deg.oil > 0.6 ? "CRITICAL" : "CAUTION", code: "OIL-PRES-DROP", description: "Lubrication pressure trending below nominal — seal wear progressing", timestamp: ts });
-  if (r.egt[3] < -20) faults.push({ id: "F003", severity: "ADVISORY", code: "EGT-C4-LOW", description: "Cylinder 4 EGT deficit — injector partial clog detected", cylinder: 4, timestamp: ts });
-  if (t.vibration > 0.22) faults.push({ id: "F004", severity: t.vibration > 0.3 ? "CRITICAL" : "ADVISORY", code: "VIB-EXCEED", description: "Broadband vibration above baseline — structural resonance", timestamp: ts });
-  return faults;
+interface ResidualItem {
+  param: string;
+  unit: string;
+  actual: number;
+  expected: number;
+  residual: number;
+  tolerance: number;
+  isInconsistent: boolean;
 }
 
-function computeHI(t: Telemetry, r: Residuals, f: Fault[], tick: number): HealthIndex {
-  const cylH = [100 - Math.max(0, r.cht[0]) * 0.3, 100 - deg.cyl2 * 55, 100 - Math.max(0, r.cht[2]) * 0.2, 100 - deg.cyl4 * 35].map(v => Math.max(0, Math.min(100, v)));
-  const lub = Math.max(0, 100 - deg.oil * 85), comb = Math.max(0, 100 - deg.cyl4 * 40), therm = Math.max(0, 100 - deg.cyl2 * 45 - (t.vibration - 0.08) * 100);
-  const overall = cylH.reduce((a, b) => a + b) / 4 * 0.35 + lub * 0.25 + comb * 0.2 + therm * 0.2;
-  return { overall: Math.round(Math.min(100, Math.max(0, overall))), cylinder: cylH.map(Math.round), lubrication: Math.round(lub), combustion: Math.round(comb), thermal: Math.round(therm), rulHours: Math.max(0, Math.round(overall / 100 * 280 - tick * 0.002)) };
+interface ModelDiagnostic {
+  name: string;
+  domain: string;
+  parameters: string;
+  prediction: string;
+  confidence: number;
+  status: "NOMINAL" | "ADVISORY" | "CAUTION" | "WARNING";
 }
 
-function TelCell({ label, value, unit, warn, crit, precision = 0, sub }: { label: string; value: number; unit: string; warn: number; crit: number; precision?: number; sub?: string }) {
-  const s = value >= crit ? "critical" : value >= warn ? "warn" : "ok";
-  const c = s === "critical" ? "#ef4444" : s === "warn" ? "#f59e0b" : "#22c55e";
-  return (
-    <div className="p-3 border flex flex-col gap-1 relative" style={{ background: s === "critical" ? "rgba(239,68,68,0.05)" : s === "warn" ? "rgba(245,158,11,0.04)" : "#0d1318", borderColor: c + "40", transition: "border-color 0.3s" }}>
-      <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.15em", color: "#556678", textTransform: "uppercase" }}>{label}</div>
-      <div style={{ fontFamily: "JetBrains Mono", fontSize: 18, fontWeight: 600, color: s === "ok" ? "white" : c, transition: "color 0.3s" }}>
-        {value.toFixed(precision)}<span style={{ fontSize: 10, fontWeight: 400, color: "#556678", marginLeft: 4 }}>{unit}</span>
-      </div>
-      {sub && <div style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>{sub}</div>}
-      {s === "critical" && <div style={{ position: "absolute", top: 5, right: 5, width: 6, height: 6, borderRadius: "50%", background: "#ef4444", animation: "pulse-amber 2s ease-in-out infinite" }} />}
-    </div>
-  );
+interface EICASAlert {
+  id: string;
+  level: "WARNING" | "CAUTION" | "ADVISORY" | "STATUS";
+  code: string;
+  message: string;
+  time: string;
+  system: string;
+  acknowledged: boolean;
 }
 
-function MiniChart({ data, color, h = 40 }: { data: number[]; color: string; h?: number }) {
-  if (data.length < 2) return <div style={{ height: h }} />;
-  const mn = Math.min(...data), mx = Math.max(...data), rng = mx - mn || 1;
-  const W = 200;
-  const pts = data.map((v, i) => `${(i / (data.length - 1)) * W},${h - ((v - mn) / rng) * h}`).join(" ");
-  return (
-    <svg viewBox={`0 0 ${W} ${h}`} preserveAspectRatio="none" style={{ width: "100%", height: h }}>
-      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" style={{ filter: `drop-shadow(0 0 3px ${color}60)` }} />
-      <polyline points={`0,${h} ${pts} ${W},${h}`} fill={`${color}10`} stroke="none" />
-    </svg>
-  );
-}
+type ScenarioType = "nominal" | "sensor_fault" | "combustion_degradation";
 
 export default function GCSDashboard() {
-  const seed = useRef(Math.random());
   const [tick, setTick] = useState(0);
-  const [tel, setTel] = useState<Telemetry>(() => generateTelemetry(0, seed.current));
-  const [base, setBase] = useState<PhysicsBaseline>(() => computePhysicsBaseline(generateTelemetry(0, seed.current)));
-  const [res, setRes] = useState<Residuals>({ cht: [0,0,0,0], egt: [0,0,0,0], oilTemp: 0, fuelFlow: 0 });
-  const [faults, setFaults] = useState<Fault[]>([]);
-  const [hi, setHI] = useState<HealthIndex>({ overall: 100, cylinder: [100,100,100,100], lubrication: 100, combustion: 100, thermal: 100, rulHours: 280 });
-  const [rpmH, setRpmH] = useState<number[]>([]);
-  const [hiH, setHiH] = useState<number[]>([]);
-  const [tab, setTab] = useState<"live"|"residuals"|"prognosis">("live");
+  const [activeTab, setActiveTab] = useState<"diagnostics" | "physics" | "eicas" | "telemetry">("physics");
+  const [scenario, setScenario] = useState<ScenarioType>("sensor_fault");
+  
+  // History buffer for the Physics Residual Analysis Graph (60 data points)
+  const [residualHistory, setResidualHistory] = useState<{ actual: number; expected: number }[]>([]);
 
+  // Telemetry generator based on active scenario
+  const generateTelemetry = (tTick: number, sc: ScenarioType): Telemetry => {
+    const t = tTick * 0.5;
+    const baseRpm = 5120 + Math.sin(t * 0.05) * 30;
+    const baseMap = 128.5 + Math.sin(t * 0.02) * 2;
+    const baseFuel = 28.4 + Math.sin(t * 0.03) * 0.4;
+    const alt = 4850 + Math.sin(t * 0.01) * 40;
+    const ambient = -14.2;
+
+    if (sc === "sensor_fault") {
+      // SCENARIO A: Sensor Fault. EGT on Cyl 3 spikes to 935°C, but CHT, Fuel, RPM remain completely nominal
+      return {
+        rpm: Math.round(baseRpm),
+        map: baseMap,
+        fuelFlow: baseFuel,
+        oilPressure: 4.8,
+        oilTemp: 92.1,
+        cht: [138, 140, 141, 139],
+        egt: [742, 739, 935, 744], // Erroneous single-point spike (+195°C)
+        vibration: 1.42,
+        altitude: alt,
+        throttle: 84,
+        missionTime: t,
+        injectionTiming: 18.2,
+        ambientTemp: ambient,
+      };
+    } else if (sc === "combustion_degradation") {
+      // SCENARIO B: Combustion Degradation. Multi-channel physical shift (Lean burn: CHT high, EGT low, fuel starved)
+      return {
+        rpm: Math.round(baseRpm - 90),
+        map: baseMap,
+        fuelFlow: baseFuel - 2.6, // Starvation
+        oilPressure: 4.7,
+        oilTemp: 93.4,
+        cht: [141, 142, 164, 140], // C3 Heat soak
+        egt: [738, 735, 680, 740], // C3 Lean quench drop
+        vibration: 1.88,
+        altitude: alt,
+        throttle: 84,
+        missionTime: t,
+        injectionTiming: 19.5,
+        ambientTemp: ambient,
+      };
+    } else {
+      // NOMINAL CRUISE
+      return {
+        rpm: Math.round(baseRpm),
+        map: baseMap,
+        fuelFlow: baseFuel,
+        oilPressure: 4.8,
+        oilTemp: 92.0,
+        cht: [138, 139, 140, 139],
+        egt: [742, 740, 741, 743],
+        vibration: 1.38,
+        altitude: alt,
+        throttle: 84,
+        missionTime: t,
+        injectionTiming: 18.0,
+        ambientTemp: ambient,
+      };
+    }
+  };
+
+  const [tel, setTel] = useState<Telemetry>(() => generateTelemetry(0, scenario));
+
+  // Compute 0D thermodynamic expectation
+  const computePhysics = (t: Telemetry, sc: ScenarioType): PhysicsBaseline => {
+    const expectedCombustionEff = 36.8;
+    let observedCombustionEff = 36.6;
+    if (sc === "combustion_degradation") {
+      observedCombustionEff = 31.9;
+    } else if (sc === "sensor_fault") {
+      // Real physical combustion efficiency is unchanged because the engine is actually healthy
+      observedCombustionEff = 36.5;
+    }
+
+    return {
+      expectedCHT: [138, 139, 140, 139],
+      expectedEGT: [740, 740, 740, 740],
+      expectedOilTemp: 91.5,
+      expectedOilPress: 4.8,
+      expectedFuelFlow: 28.2,
+      expectedCombustionEff,
+      observedCombustionEff,
+      efficiencyResidual: Number((expectedCombustionEff - observedCombustionEff).toFixed(1)),
+    };
+  };
+
+  const [base, setBase] = useState<PhysicsBaseline>(() => computePhysics(generateTelemetry(0, scenario), scenario));
+
+  // Telemetry clock cycle
   useEffect(() => {
     const iv = setInterval(() => {
-      setTick(prev => {
-        const n = prev + 1;
-        const t = generateTelemetry(n, seed.current);
-        const b = computePhysicsBaseline(t);
-        const r = computeResiduals(t, b);
-        const f = detectFaults(t, r);
-        const h = computeHI(t, r, f, n);
-        setTel(t); setBase(b); setRes(r); setFaults(f); setHI(h);
-        setRpmH(p => [...p.slice(-60), t.rpm]);
-        setHiH(p => [...p.slice(-60), h.overall]);
-        return n;
+      setTick((prev) => {
+        const next = prev + 1;
+        const currentTel = generateTelemetry(next, scenario);
+        const currentBase = computePhysics(currentTel, scenario);
+        setTel(currentTel);
+        setBase(currentBase);
+
+        // Update residual trend buffer (EGT Cyl 3)
+        setResidualHistory((h) => [
+          ...h.slice(-35),
+          { actual: currentTel.egt[2], expected: currentBase.expectedEGT[2] },
+        ]);
+
+        return next;
       });
     }, 500);
     return () => clearInterval(iv);
-  }, []);
+  }, [scenario]);
 
-  const critFault = faults.find(f => f.severity === "CRITICAL");
-  const hiColor = hi.overall > 75 ? "#22c55e" : hi.overall > 50 ? "#f59e0b" : "#ef4444";
-  const mins = Math.floor(tel.missionTime / 60), secs = Math.floor(tel.missionTime % 60);
+  // Derive Physics Residual Table
+  const residualTable: ResidualItem[] = [
+    {
+      param: "Cyl 3 EGT (Exhaust Temp)",
+      unit: "°C",
+      actual: tel.egt[2],
+      expected: base.expectedEGT[2],
+      residual: Number((tel.egt[2] - base.expectedEGT[2]).toFixed(1)),
+      tolerance: 20.0,
+      isInconsistent: Math.abs(tel.egt[2] - base.expectedEGT[2]) > 20.0,
+    },
+    {
+      param: "Cyl 3 CHT (Head Temp)",
+      unit: "°C",
+      actual: tel.cht[2],
+      expected: base.expectedCHT[2],
+      residual: Number((tel.cht[2] - base.expectedCHT[2]).toFixed(1)),
+      tolerance: 6.0,
+      isInconsistent: Math.abs(tel.cht[2] - base.expectedCHT[2]) > 6.0,
+    },
+    {
+      param: "Fuel Mass Flow",
+      unit: "L/h",
+      actual: Number(tel.fuelFlow.toFixed(1)),
+      expected: base.expectedFuelFlow,
+      residual: Number((tel.fuelFlow - base.expectedFuelFlow).toFixed(1)),
+      tolerance: 1.2,
+      isInconsistent: Math.abs(tel.fuelFlow - base.expectedFuelFlow) > 1.2,
+    },
+    {
+      param: "Engine RPM",
+      unit: "RPM",
+      actual: tel.rpm,
+      expected: 5120,
+      residual: tel.rpm - 5120,
+      tolerance: 60,
+      isInconsistent: Math.abs(tel.rpm - 5120) > 60,
+    },
+    {
+      param: "Oil Sump Pressure",
+      unit: "bar",
+      actual: Number(tel.oilPressure.toFixed(1)),
+      expected: base.expectedOilPress,
+      residual: Number((tel.oilPressure - base.expectedOilPress).toFixed(1)),
+      tolerance: 0.4,
+      isInconsistent: Math.abs(tel.oilPressure - base.expectedOilPress) > 0.4,
+    },
+    {
+      param: "Oil Delivery Temp",
+      unit: "°C",
+      actual: Number(tel.oilTemp.toFixed(1)),
+      expected: base.expectedOilTemp,
+      residual: Number((tel.oilTemp - base.expectedOilTemp).toFixed(1)),
+      tolerance: 2.5,
+      isInconsistent: Math.abs(tel.oilTemp - base.expectedOilTemp) > 2.5,
+    },
+  ];
 
-  const cylColors = hi.cylinder.map(h => h < 40 ? "#ef4444" : h < 65 ? "#f59e0b" : "#22c55e");
+  // Derive Systemic Scores
+  let physicsScore = 98;
+  let stateConfidence = 96;
+  let diagnosisHeader = "SYSTEMS NOMINAL // IN ENVELOPE";
+  let diagnosisSub = "All sensor observations track within thermodynamic 0D state boundary.";
+  let statusBannerColor = "#22c55e";
+
+  if (scenario === "sensor_fault") {
+    physicsScore = 41;
+    stateConfidence = 94; // Model is confident that the engine is fine and the sensor is bad
+    diagnosisHeader = "PHYSICAL INCONSISTENCY // LIKELY SENSOR FAULT (CYL 3 EGT PROBE)";
+    diagnosisSub = "EGT thermocouple indicates +195°C excursion without correlating enthalpy increase in CHT, fuel flow, or thermal soak. Physics equations reject overheat hypothesis. False abort command suppressed.";
+    statusBannerColor = "#f59e0b";
+  } else if (scenario === "combustion_degradation") {
+    physicsScore = 32;
+    stateConfidence = 44; // Model recognizes authentic plant degradation
+    diagnosisHeader = "COMBUSTION DEGRADATION // CORRELATED MULTI-CHANNEL DRIFT";
+    diagnosisSub = "Correlated thermal divergence confirmed: localized fuel flow deficit (-2.6 L/h) coincides with CHT heat soak (+24°C) and manifold EGT deficit (-60°C). Cylinder #3 injector failure confirmed.";
+    statusBannerColor = "#ef4444";
+  }
+
+  // 5 Specialized AI Models
+  const aiModels: ModelDiagnostic[] = [
+    {
+      name: "Thermal AI",
+      domain: "Thermodynamic Heat Soak",
+      parameters: "CHT Cyl 1-4, Coolant Temp, Ambient ΔT",
+      prediction: scenario === "combustion_degradation" ? "Cyl 3 Thermal Soak Anomaly (+24°C)" : "Thermal Rails In-Envelope",
+      confidence: 94,
+      status: scenario === "combustion_degradation" ? "CAUTION" : "NOMINAL",
+    },
+    {
+      name: "Combustion AI",
+      domain: "Cycle Enthalpy & Stoichiometry",
+      parameters: "EGT Cyl 1-4, Fuel Mass Flow, MAP",
+      prediction: scenario === "sensor_fault" ? "EGT Isolated Reading Discordant" : scenario === "combustion_degradation" ? "Cyl 3 Under-Fueling / Lean Quench" : "Stoichiometric Nominal",
+      confidence: 96,
+      status: scenario === "sensor_fault" ? "ADVISORY" : scenario === "combustion_degradation" ? "CAUTION" : "NOMINAL",
+    },
+    {
+      name: "Vibration AI",
+      domain: "Harmonic & Torsional Analysis",
+      parameters: "Tri-Axial Accel (Crankcase/Hub)",
+      prediction: scenario === "combustion_degradation" ? "Torsional Harmonic Flutter (1.88g)" : "Broadband Vibration Nominal (1.42g)",
+      confidence: 89,
+      status: scenario === "combustion_degradation" ? "ADVISORY" : "NOMINAL",
+    },
+    {
+      name: "Lubrication AI",
+      domain: "Hydrodynamic Boundary Film",
+      parameters: "Oil Pressure (4.8 bar), Sump Temp (92°C)",
+      prediction: "Nominal Viscosity Retention & Shearing",
+      confidence: 97,
+      status: "NOMINAL",
+    },
+    {
+      name: "Electrical AI",
+      domain: "FADEC Rail & Actuator Bus",
+      parameters: "Injector Driver Bus, Spark Coil Voltage",
+      prediction: "Rail Voltage Stable (28.2V DC)",
+      confidence: 99,
+      status: "NOMINAL",
+    },
+  ];
+
+  // EICAS Alerts list
+  const [alerts, setAlerts] = useState<EICASAlert[]>([
+    { id: "A1", level: "WARNING", code: "ENG-WARN-0", message: "CRITICAL REDLINE CLEAR (0 ACTIVE REDLINES)", time: "12:04:18Z", system: "FADEC", acknowledged: true },
+    { id: "A2", level: "CAUTION", code: "THERMO-INCON", message: "EGT SENSOR DECOUPLED FROM CHT / FUEL DYNAMICS", time: "12:04:22Z", system: "PHYSICS", acknowledged: false },
+    { id: "A3", level: "ADVISORY", code: "INJ-AUTOTRIM", message: "FADEC TRIM RUNNING CLOSED-LOOP BALANCE", time: "12:04:30Z", system: "FUEL", acknowledged: false },
+    { id: "A4", level: "STATUS", code: "RESIDUAL-10HZ", message: "PHYSICS-MODEL CONVERGENCE VALIDATED AT 50HZ", time: "12:05:01Z", system: "DIGITAL-TWIN", acknowledged: true },
+  ]);
+
+  const mins = Math.floor(tel.missionTime / 60);
+  const secs = Math.floor(tel.missionTime % 60);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#080c10", fontFamily: "Inter, sans-serif", overflow: "hidden" }}>
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px", height: 44, borderBottom: "1px solid #1e2d3d", background: "#080c10", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <span style={{ fontFamily: "Rajdhani", fontWeight: 700, fontSize: 15, letterSpacing: "0.15em", color: "#f59e0b" }}>AeroDTwin</span>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678", letterSpacing: "0.15em" }}>GCS ENGINE DIGITAL TWIN · MQ-ALPHA-07</span>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        background: "#070b10",
+        color: "#e2e8f0",
+        fontFamily: "Inter, sans-serif",
+        overflow: "hidden",
+        border: "1px solid #1e293b",
+      }}
+    >
+      {/* ─── Top Telemetry Status Bar ──────────────────────────────────── */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 18px",
+          height: 44,
+          background: "#0c131d",
+          borderBottom: "1px solid #1e2d3d",
+          flexShrink: 0,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ width: 8, height: 8, background: statusBannerColor, boxShadow: `0 0 8px ${statusBannerColor}` }} />
+          <span style={{ fontFamily: "Rajdhani, sans-serif", fontWeight: 700, fontSize: 16, letterSpacing: "0.15em", color: "#38bdf8" }}>
+            AERODTWIN // PROPULSION GCS
+          </span>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "#64748b", borderLeft: "1px solid #334155", paddingLeft: 12 }}>
+            AIRFRAME: MALE-UAV-BLK-II · STANAG 4586
+          </span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8fa0b0" }}>ALT <b style={{ color: "#fff" }}>{Math.round(tel.altitude).toLocaleString()}</b>m</span>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#8fa0b0" }}>MET <b style={{ color: "#fff" }}>{String(mins).padStart(3,"0")}:{String(secs).padStart(2,"0")}</b></span>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: hiColor, fontWeight: 700 }}>HI {hi.overall}%</span>
-          <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#22c55e", display: "inline-block", animation: "pulse 2s infinite" }} />
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#22c55e", letterSpacing: "0.15em" }}>LIVE</span>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "#94a3b8" }}>
+            ALT <strong style={{ color: "#fff" }}>{Math.round(tel.altitude)}</strong> m
+          </span>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "#94a3b8" }}>
+            OAT <strong style={{ color: "#38bdf8" }}>{tel.ambientTemp}°C</strong>
+          </span>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "#94a3b8" }}>
+            MET <strong style={{ color: "#fff" }}>{String(mins).padStart(2, "0")}:{String(secs).padStart(2, "0")}</strong>
+          </span>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, padding: "2px 8px", background: "#38bdf820", color: "#38bdf8", border: "1px solid #38bdf850" }}>
+            FADEC 50Hz CAN
+          </span>
         </div>
       </div>
 
-      {/* Advisory */}
-      {critFault && (
-        <div style={{ padding: "6px 20px", background: "rgba(239,68,68,0.1)", borderBottom: "1px solid rgba(239,68,68,0.3)", display: "flex", gap: 12, alignItems: "center" }}>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#ef4444", fontWeight: 700, letterSpacing: "0.2em" }}>▲ ADVISORY</span>
-          <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#fca5a5" }}>{critFault.code} — {critFault.description}</span>
+      {/* ─── Navigation Bar ────────────────────────────────────────────── */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          background: "#0a0e14",
+          borderBottom: "1px solid #1e2d3d",
+          padding: "0 18px",
+          flexShrink: 0,
+        }}
+      >
+        <div style={{ display: "flex", gap: 4 }}>
+          {[
+            { id: "physics", label: "Physics-Based State Validation" },
+            { id: "diagnostics", label: "Multi-Model Fusion & AI" },
+            { id: "eicas", label: "EICAS & Fault Log" },
+            { id: "telemetry", label: "Raw Telemetry Matrix" },
+          ].map((tab) => {
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id as any)}
+                style={{
+                  padding: "9px 18px",
+                  background: isActive ? "#111a26" : "transparent",
+                  border: "none",
+                  borderBottom: isActive ? "3px solid #38bdf8" : "3px solid transparent",
+                  color: isActive ? "#38bdf8" : "#64748b",
+                  fontFamily: "Rajdhani, sans-serif",
+                  fontSize: 12,
+                  fontWeight: 700,
+                  letterSpacing: "0.15em",
+                  textTransform: "uppercase",
+                  cursor: "pointer",
+                }}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
-      )}
 
-      {/* Tabs */}
-      <div style={{ display: "flex", alignItems: "center", padding: "0 20px", borderBottom: "1px solid #1e2d3d", background: "#080c10", gap: 0, flexShrink: 0 }}>
-        {(["live","residuals","prognosis"] as const).map(t => (
-          <button key={t} onClick={() => setTab(t)}
-            style={{ fontFamily: "Rajdhani", fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", padding: "10px 16px", background: "none", border: "none", borderBottom: `2px solid ${tab === t ? "#f59e0b" : "transparent"}`, color: tab === t ? "#f59e0b" : "#556678", cursor: "pointer", transition: "all 0.2s" }}>
-            {t === "live" ? "Live Telemetry" : t === "residuals" ? "State Residuals" : "Prognostics"}
-          </button>
-        ))}
-        <div style={{ marginLeft: "auto", fontFamily: "JetBrains Mono", fontSize: 10, color: "#556678" }}>
-          THR <span style={{ color: "#f59e0b" }}>{Math.round(tel.throttle)}%</span> · MAP <span style={{ color: "#fff" }}>{tel.map.toFixed(1)} kPa</span>
+        {/* Real-time Scenario Injector Controls */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b", textTransform: "uppercase" }}>
+            TEST SCENARIO:
+          </span>
+          {[
+            { id: "nominal", label: "Nominal" },
+            { id: "sensor_fault", label: "Scenario A: Sensor Fault" },
+            { id: "combustion_degradation", label: "Scenario B: Degradation" },
+          ].map((sc) => (
+            <button
+              key={sc.id}
+              onClick={() => setScenario(sc.id as ScenarioType)}
+              style={{
+                padding: "3px 8px",
+                fontFamily: "JetBrains Mono, monospace",
+                fontSize: 9,
+                fontWeight: 700,
+                background: scenario === sc.id ? "#38bdf825" : "#0d131d",
+                color: scenario === sc.id ? "#38bdf8" : "#64748b",
+                border: `1px solid ${scenario === sc.id ? "#38bdf8" : "#1e293b"}`,
+                cursor: "pointer",
+              }}
+            >
+              {sc.label}
+            </button>
+          ))}
         </div>
       </div>
 
-      {/* Body */}
-      <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
-        {tab === "live" && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(12,1fr)", gap: 12 }}>
-            {/* Primary readouts */}
-            <div style={{ gridColumn: "span 8", background: "#0d1318", border: "1px solid #1e2d3d", padding: 16 }}>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#556678", textTransform: "uppercase", marginBottom: 12 }}>Primary Parameters</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
-                <TelCell label="RPM" value={tel.rpm} unit="rpm" warn={2500} crit={2650} />
-                <TelCell label="Oil Pressure" value={tel.oilPressure} unit="kPa" warn={270} crit={220} />
-                <TelCell label="Oil Temp" value={tel.oilTemp} unit="°C" warn={110} crit={125} />
-                <TelCell label="Fuel Flow" value={tel.fuelFlow} unit="L/h" warn={18} crit={20} precision={1} />
+      {/* ─── Main Content Views ────────────────────────────────────────── */}
+      <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+        
+        {/* ══════════════════════════════════════════════════════════════════
+            TAB: PHYSICS-BASED ENGINE STATE VALIDATION
+        ══════════════════════════════════════════════════════════════════ */}
+        {activeTab === "physics" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            
+            {/* ─── Top Banner: Diagnostics & Score Badges ─── */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 220px 220px",
+                gap: 10,
+              }}
+            >
+              {/* Classification Alert Box */}
+              <div
+                style={{
+                  background: "#0c131e",
+                  border: `1px solid ${statusBannerColor}`,
+                  borderLeft: `5px solid ${statusBannerColor}`,
+                  padding: "10px 14px",
+                  display: "flex",
+                  flexDirection: "column",
+                  justifyContent: "center",
+                }}
+              >
+                <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: statusBannerColor, letterSpacing: "0.15em", fontWeight: 700 }}>
+                  DIAGNOSTIC VERDICT:
+                </div>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 19, fontWeight: 800, color: "#f8fafc", letterSpacing: "0.05em" }}>
+                  {diagnosisHeader}
+                </div>
+                <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#94a3b8", marginTop: 2, lineHeight: 1.4 }}>
+                  {diagnosisSub}
+                </div>
+              </div>
+
+              {/* Physics Consistency Score */}
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: "8px 12px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 11, letterSpacing: "0.15em", color: "#64748b", textTransform: "uppercase" }}>
+                  PHYSICS CONSISTENCY SCORE
+                </div>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 32, fontWeight: 800, color: physicsScore > 75 ? "#22c55e" : physicsScore > 45 ? "#f59e0b" : "#ef4444", lineHeight: 1.1 }}>
+                  {physicsScore}<span style={{ fontSize: 14, color: "#64748b" }}>%</span>
+                </div>
+                <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b", marginTop: 2 }}>
+                  {physicsScore > 75 ? "CONSERVATION LAWS BALANCED" : "LOCALIZED EQUATION DRIFT"}
+                </div>
+              </div>
+
+              {/* Engine State Confidence */}
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: "8px 12px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 11, letterSpacing: "0.15em", color: "#64748b", textTransform: "uppercase" }}>
+                  ENGINE STATE CONFIDENCE
+                </div>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 32, fontWeight: 800, color: stateConfidence > 75 ? "#38bdf8" : "#f59e0b", lineHeight: 1.1 }}>
+                  {stateConfidence}<span style={{ fontSize: 14, color: "#64748b" }}>%</span>
+                </div>
+                <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b", marginTop: 2 }}>
+                  OBSERVER CERTAINTY LEVEL
+                </div>
               </div>
             </div>
 
-            {/* HI panel */}
-            <div style={{ gridColumn: "span 4", background: "#0d1318", border: "1px solid #1e2d3d", padding: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#556678", textTransform: "uppercase" }}>Engine Health</div>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 48, fontWeight: 700, color: hiColor, lineHeight: 1, textShadow: `0 0 20px ${hiColor}60` }}>{hi.overall}<span style={{ fontSize: 20, color: "#556678" }}>/100</span></div>
-              <div style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678", letterSpacing: "0.1em" }}>RUL ESTIMATE</div>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 28, fontWeight: 700, color: "#f59e0b" }}>{hi.rulHours}<span style={{ fontSize: 13, color: "#556678", marginLeft: 4 }}>hrs</span></div>
-              <div style={{ height: 4, background: "#0d1318", border: "1px solid #1e2d3d" }}>
-                <div style={{ height: "100%", width: `${(hi.rulHours / 280) * 100}%`, background: "#f59e0b", transition: "width 0.5s" }} />
+            {/* ─── Virtual Engine Model Schematic ─── */}
+            <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e2d3d", paddingBottom: 6, marginBottom: 10 }}>
+                <span style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#38bdf8", textTransform: "uppercase" }}>
+                  VIRTUAL ENGINE MODEL ARCHITECTURE // 0D THERMODYNAMIC CYCLE KERNEL
+                </span>
+                <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b" }}>
+                  CONSERVATION OF MASS & ENERGY SOLVER (20ms CYCLE)
+                </span>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr 1fr", gap: 12, alignItems: "center" }}>
+                
+                {/* Inputs to Physics Model */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#38bdf8", fontWeight: 700, letterSpacing: "0.1em" }}>
+                    INCOMING SENSOR STREAMS (FADEC)
+                  </div>
+                  {[
+                    { l: "Engine RPM", v: `${tel.rpm} RPM` },
+                    { l: "Fuel Mass Flow Rate", v: `${tel.fuelFlow.toFixed(1)} L/h` },
+                    { l: "Injection Timing", v: `${tel.injectionTiming.toFixed(1)}° BTDC` },
+                    { l: "Manifold Pressure (MAP)", v: `${tel.map.toFixed(1)} kPa` },
+                    { l: "Altitude & Ambient Temp", v: `${Math.round(tel.altitude)}m / ${tel.ambientTemp}°C` },
+                    { l: "Oil Press & Temp", v: `${tel.oilPressure.toFixed(1)} bar / ${tel.oilTemp.toFixed(0)}°C` },
+                  ].map((item, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        background: "#080c10",
+                        border: "1px solid #1a2535",
+                        padding: "4px 8px",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontFamily: "JetBrains Mono, monospace",
+                        fontSize: 9,
+                      }}
+                    >
+                      <span style={{ color: "#64748b" }}>{item.l}</span>
+                      <span style={{ color: "#f8fafc", fontWeight: 600 }}>{item.v}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Central 0D Thermodynamic Kernel Block */}
+                <div
+                  style={{
+                    background: "#080d14",
+                    border: "1px solid #38bdf840",
+                    padding: "12px",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    textAlign: "center",
+                    position: "relative",
+                  }}
+                >
+                  <div style={{ width: 10, height: 10, borderRadius: "50%", background: "#38bdf8", boxShadow: "0 0 10px #38bdf8", marginBottom: 6 }} />
+                  <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 16, fontWeight: 800, color: "#fff", letterSpacing: "0.1em" }}>
+                    PHYSICS TWIN ENGINE
+                  </div>
+                  <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#38bdf8", marginBottom: 8 }}>
+                    0D MEAN-VALUE THERMODYNAMICS
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, width: "100%", textAlign: "left", fontSize: 8, fontFamily: "JetBrains Mono, monospace" }}>
+                    <div style={{ background: "#0c131d", padding: "4px 6px", border: "1px solid #1e293b", color: "#94a3b8" }}>
+                      HEAT RELEASE: <span style={{ color: "#fff" }}>WIEBE FUNCTION</span>
+                    </div>
+                    <div style={{ background: "#0c131d", padding: "4px 6px", border: "1px solid #1e293b", color: "#94a3b8" }}>
+                      HEAT TRANSFER: <span style={{ color: "#fff" }}>WOSCHNI EQ</span>
+                    </div>
+                    <div style={{ background: "#0c131d", padding: "4px 6px", border: "1px solid #1e293b", color: "#94a3b8" }}>
+                      EXP EFFICIENCY: <span style={{ color: "#38bdf8" }}>{base.expectedCombustionEff}%</span>
+                    </div>
+                    <div style={{ background: "#0c131d", padding: "4px 6px", border: "1px solid #1e293b", color: "#94a3b8" }}>
+                      OBS EFFICIENCY: <span style={{ color: scenario === "combustion_degradation" ? "#ef4444" : "#22c55e" }}>{base.observedCombustionEff}%</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Predicted States Coming Out */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#22c55e", fontWeight: 700, letterSpacing: "0.1em" }}>
+                    PREDICTED THERMODYNAMIC STATES
+                  </div>
+                  {[
+                    { l: "Expected EGT (Cyl 1-4)", v: `${base.expectedEGT[2]}°C Nominal` },
+                    { l: "Expected CHT (Cyl 1-4)", v: `${base.expectedCHT[2]}°C Nominal` },
+                    { l: "Expected Fuel Burn", v: `${base.expectedFuelFlow} L/h` },
+                    { l: "Expected Oil Press/Temp", v: `${base.expectedOilPress} bar / ${base.expectedOilTemp}°C` },
+                    { l: "Efficiency Residual (Δ)", v: `+${base.efficiencyResidual}%` },
+                    { l: "Cycle State Validity", v: scenario === "sensor_fault" ? "DECOUPLED (1 CH)" : scenario === "combustion_degradation" ? "DEGRADED" : "COHERENT" },
+                  ].map((item, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        background: "#080c10",
+                        border: "1px solid #1a2535",
+                        padding: "4px 8px",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontFamily: "JetBrains Mono, monospace",
+                        fontSize: 9,
+                      }}
+                    >
+                      <span style={{ color: "#64748b" }}>{item.l}</span>
+                      <span style={{ color: "#38bdf8", fontWeight: 600 }}>{item.v}</span>
+                    </div>
+                  ))}
+                </div>
+
               </div>
             </div>
 
-            {/* CHT / EGT cells */}
-            <div style={{ gridColumn: "span 12", display: "grid", gridTemplateColumns: "repeat(8,1fr)", gap: 8 }}>
-              {tel.cht.map((v, i) => (
-                <TelCell key={`cht${i}`} label={`CHT CYL ${i+1}`} value={v} unit="°C" warn={185} crit={220} sub={`Δ${res.cht[i]>=0?"+":""}${res.cht[i].toFixed(1)}°`} />
-              ))}
-              {tel.egt.map((v, i) => (
-                <TelCell key={`egt${i}`} label={`EGT CYL ${i+1}`} value={v} unit="°C" warn={820} crit={900} sub={`Δ${res.egt[i]>=0?"+":""}${res.egt[i].toFixed(1)}°`} />
-              ))}
-            </div>
+            {/* ─── Bottom Split: Residual Table & Dynamic Graph ─── */}
+            <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 10 }}>
+              
+              {/* Residual Comparison Table */}
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #1e2d3d", paddingBottom: 6, marginBottom: 8 }}>
+                  <span style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#38bdf8", textTransform: "uppercase" }}>
+                    PHYSICS-BASED ENGINE STATE VALIDATION TABLE
+                  </span>
+                  <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b" }}>
+                    Δ = ACTUAL − EXPECTED
+                  </span>
+                </div>
 
-            {/* Cylinder 3D schematic */}
-            <div style={{ gridColumn: "span 8", background: "#0d1318", border: "1px solid #1e2d3d", padding: 16 }}>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase", marginBottom: 8 }}>Cylinder Bank — Thermal Status</div>
-              <svg viewBox="0 0 480 180" style={{ width: "100%", maxHeight: 160 }}>
-                <rect x="20" y="110" width="440" height="45" fill="#111820" stroke="#1e2d3d" strokeWidth="1" />
-                {[60,155,250,345].map((x,i) => {
-                  const intensity = Math.min(1, Math.max(0, (tel.cht[i] - 120) / 120));
-                  const col = cylColors[i];
-                  const rgb = col === "#ef4444" ? "239,68,68" : col === "#f59e0b" ? "245,158,11" : "34,197,94";
-                  return (
-                    <g key={i}>
-                      <rect x={x} y="45" width="75" height="68" rx="1"
-                        fill={`rgba(${rgb},${intensity*0.15+0.04})`} stroke={col} strokeWidth="1"
-                        style={{ filter: `drop-shadow(0 0 6px rgba(${rgb},0.4))`, transition: "all 0.5s" }} />
-                      <polygon points={`${x+75},45 ${x+86},34 ${x+86},103 ${x+75},113`} fill={`rgba(${rgb},${intensity*0.07+0.02})`} stroke={col} strokeWidth="0.5" opacity="0.5" />
-                      <polygon points={`${x},45 ${x+11},34 ${x+86},34 ${x+75},45`} fill={`rgba(${rgb},${intensity*0.1+0.05})`} stroke={col} strokeWidth="0.5" opacity="0.6" />
-                      {[8,18,28,38,48].map((dy,j) => <line key={j} x1={x+4} y1={45+dy} x2={x+71} y2={45+dy} stroke={col} strokeWidth="0.3" opacity="0.15" />)}
-                      <circle cx={x+37} cy="28" r="4" fill="#0d1318" stroke={col} strokeWidth="1" />
-                      <line x1={x+37} y1="32" x2={x+37} y2="45" stroke={col} strokeWidth="0.8" opacity="0.5" />
-                      <text x={x+37} y="91" textAnchor="middle" fontFamily="JetBrains Mono" fontSize="11" fill={col} fontWeight="600">CYL {i+1}</text>
-                      <text x={x+37} y="103" textAnchor="middle" fontFamily="JetBrains Mono" fontSize="9" fill={col} opacity="0.8">{Math.round(tel.cht[i])}°C</text>
-                      <rect x={x+20} y="52" width="35" height="14" rx="1" fill="rgba(8,12,16,0.8)" stroke={col} strokeWidth="0.5" />
-                      <text x={x+37} y="62" textAnchor="middle" fontFamily="JetBrains Mono" fontSize="8" fill={col} fontWeight="700">{hi.cylinder[i]}%</text>
-                    </g>
-                  );
-                })}
-                <text x="240" y="168" textAnchor="middle" fontFamily="JetBrains Mono" fontSize="8" fill="#556678">FLAT-4 OPPOSED BOXER</text>
-              </svg>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6, marginTop: 8 }}>
-                {[0,1,2,3].map(i => (
-                  <div key={i} style={{ background: "#080c10", border: `1px solid ${cylColors[i]}40`, padding: "8px 10px" }}>
-                    <div style={{ fontFamily: "Rajdhani", fontSize: 9, color: "#556678", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>CYL {i+1}</div>
-                    {[["CHT",`${Math.round(tel.cht[i])}°C`],["EGT",`${Math.round(tel.egt[i])}°C`],["HI",`${hi.cylinder[i]}%`]].map(([k,v]) => (
-                      <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
-                        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>{k}</span>
-                        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, fontWeight: 600, color: cylColors[i] }}>{v}</span>
-                      </div>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "JetBrains Mono, monospace", fontSize: 9 }}>
+                  <thead>
+                    <tr style={{ borderBottom: "1px solid #1e293b", color: "#64748b", textAlign: "left" }}>
+                      <th style={{ padding: "6px 4px" }}>PARAMETER</th>
+                      <th style={{ padding: "6px 4px" }}>ACTUAL SENSOR</th>
+                      <th style={{ padding: "6px 4px" }}>PHYSICS EXPECTED</th>
+                      <th style={{ padding: "6px 4px" }}>RESIDUAL (Δ)</th>
+                      <th style={{ padding: "6px 4px", textAlign: "right" }}>PHYSICAL STATUS</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {residualTable.map((row, i) => (
+                      <tr
+                        key={i}
+                        style={{
+                          borderBottom: "1px solid #121a24",
+                          background: row.isInconsistent ? "rgba(239, 68, 68, 0.08)" : "transparent",
+                        }}
+                      >
+                        <td style={{ padding: "6px 4px", color: row.isInconsistent ? "#fca5a5" : "#e2e8f0" }}>{row.param}</td>
+                        <td style={{ padding: "6px 4px", color: row.isInconsistent ? "#ef4444" : "#fff", fontWeight: 700 }}>
+                          {row.actual} {row.unit}
+                        </td>
+                        <td style={{ padding: "6px 4px", color: "#94a3b8" }}>
+                          {row.expected} {row.unit}
+                        </td>
+                        <td style={{ padding: "6px 4px", color: row.isInconsistent ? "#ef4444" : "#22c55e", fontWeight: 700 }}>
+                          {row.residual >= 0 ? `+${row.residual}` : row.residual} {row.unit}
+                        </td>
+                        <td style={{ padding: "6px 4px", textAlign: "right" }}>
+                          <span
+                            style={{
+                              padding: "2px 6px",
+                              fontSize: 8,
+                              fontWeight: 700,
+                              background: row.isInconsistent ? "#ef444425" : "#22c55e25",
+                              border: `1px solid ${row.isInconsistent ? "#ef4444" : "#22c55e"}`,
+                              color: row.isInconsistent ? "#ef4444" : "#22c55e",
+                            }}
+                          >
+                            {row.isInconsistent ? "INCONSISTENCY" : "NOMINAL"}
+                          </span>
+                        </td>
+                      </tr>
                     ))}
-                  </div>
-                ))}
+                  </tbody>
+                </table>
               </div>
-            </div>
 
-            {/* Faults */}
-            <div style={{ gridColumn: "span 4", background: "#0d1318", border: "1px solid #1e2d3d", padding: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase" }}>Fault Register</span>
-                <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: faults.length > 0 ? "#ef4444" : "#22c55e" }}>{faults.length > 0 ? `${faults.length} ACTIVE` : "CLEAR"}</span>
-              </div>
-              {faults.length === 0 ? (
-                <div style={{ flex: 1, border: "1px solid rgba(34,197,94,0.2)", background: "rgba(34,197,94,0.05)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-                  <div style={{ textAlign: "center", fontFamily: "JetBrains Mono", fontSize: 10, color: "#22c55e" }}>■ ALL SYSTEMS NOMINAL</div>
-                </div>
-              ) : faults.map(f => {
-                const fc = f.severity === "CRITICAL" ? "#ef4444" : f.severity === "CAUTION" ? "#f59e0b" : "#60a5fa";
-                return (
-                  <div key={f.id} style={{ border: `1px solid ${fc}40`, background: `${fc}08`, padding: "10px 12px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                        <span style={{ fontFamily: "JetBrains Mono", fontSize: 8, color: fc, fontWeight: 700, letterSpacing: "0.15em" }}>{f.severity}</span>
-                        <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, color: "#fff", fontWeight: 600 }}>{f.code}</span>
-                      </div>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>{f.timestamp}Z</span>
-                    </div>
-                    <div style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#8fa0b0", lineHeight: 1.5 }}>{f.description}</div>
+              {/* Physics Residual Analysis Graph */}
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12, display: "flex", flexDirection: "column" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #1e2d3d", paddingBottom: 6, marginBottom: 8 }}>
+                  <span style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#38bdf8", textTransform: "uppercase" }}>
+                    PHYSICS RESIDUAL ANALYSIS (CYL 3 EGT)
+                  </span>
+                  <div style={{ display: "flex", gap: 8, fontFamily: "JetBrains Mono, monospace", fontSize: 8 }}>
+                    <span style={{ color: "#ef4444" }}>● MEASURED</span>
+                    <span style={{ color: "#38bdf8" }}>● EXPECTED</span>
                   </div>
-                );
-              })}
+                </div>
+
+                <div style={{ flex: 1, minHeight: 140, background: "#070b10", border: "1px solid #1a2535", position: "relative", overflow: "hidden", padding: 8 }}>
+                  {/* SVG Line Graph */}
+                  <svg viewBox="0 0 300 130" preserveAspectRatio="none" style={{ width: "100%", height: "100%" }}>
+                    {/* Tolerance corridor */}
+                    <rect x="0" y="45" width="300" height="40" fill="rgba(56, 189, 248, 0.08)" />
+                    <line x1="0" y1="65" x2="300" y2="65" stroke="#38bdf8" strokeDasharray="3,3" strokeWidth="0.8" opacity="0.4" />
+
+                    {/* Plot Expected */}
+                    <polyline
+                      points={residualHistory.map((pt, i) => `${(i / (residualHistory.length - 1 || 1)) * 300},65`).join(" ")}
+                      fill="none"
+                      stroke="#38bdf8"
+                      strokeWidth="1.5"
+                    />
+
+                    {/* Plot Actual */}
+                    <polyline
+                      points={residualHistory
+                        .map((pt, i) => {
+                          const delta = pt.actual - 740;
+                          const y = Math.max(10, Math.min(120, 65 - delta * 0.35));
+                          return `${(i / (residualHistory.length - 1 || 1)) * 300},${y}`;
+                        })
+                        .join(" ")}
+                      fill="none"
+                      stroke={scenario === "nominal" ? "#22c55e" : "#ef4444"}
+                      strokeWidth="2"
+                    />
+                  </svg>
+
+                  <div style={{ position: "absolute", bottom: 4, right: 6, fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>
+                    WINDOW: 35s TIME-SERIES · ±20°C ENVELOPE
+                  </div>
+                </div>
+
+                <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b", marginTop: 6, lineHeight: 1.4 }}>
+                  Isolated departures exceeding the ±20°C envelope without corresponding CHT gradient indicate non-physical thermocouple drift.
+                </div>
+              </div>
+
             </div>
           </div>
         )}
 
-        {tab === "residuals" && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(12,1fr)", gap: 12 }}>
-            <div style={{ gridColumn: "span 8", background: "#0d1318", border: "1px solid #1e2d3d", padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase" }}>State Residual Tracker — Δ = Actual − Expected</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-                {[{ title: "CHT Residuals (°C)", vals: res.cht, range: 60, unit: "°C" }, { title: "EGT Residuals (°C)", vals: res.egt, range: 80, unit: "°C" }].map(({ title, vals, range, unit }) => (
-                  <div key={title}>
-                    <div style={{ fontFamily: "Rajdhani", fontSize: 11, color: "#f59e0b", letterSpacing: "0.15em", textTransform: "uppercase", borderBottom: "1px solid #1e2d3d", paddingBottom: 6, marginBottom: 12 }}>{title}</div>
-                    {vals.map((v, i) => {
-                      const pct = Math.max(-1, Math.min(1, v / range));
-                      const c = Math.abs(pct) > 0.6 ? "#ef4444" : Math.abs(pct) > 0.3 ? "#f59e0b" : "#22c55e";
-                      const bw = Math.abs(pct) * 50;
-                      return (
-                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                          <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678", width: 40, textAlign: "right" }}>CYL {i+1}</span>
-                          <div style={{ flex: 1, height: 14, background: "#080c10", border: "1px solid #1e2d3d", position: "relative", display: "flex", alignItems: "center" }}>
-                            <div style={{ position: "absolute", left: "50%", width: 1, height: "100%", background: "#1e2d3d" }} />
-                            <div style={{ position: "absolute", height: 8, width: `${bw}%`, left: pct >= 0 ? "50%" : `${50 - bw}%`, background: c, opacity: 0.8, transition: "all 0.4s ease" }} />
-                          </div>
-                          <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: c, width: 52 }}>{v >= 0 ? "+" : ""}{v.toFixed(1)}{unit}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, borderTop: "1px solid #1e2d3d", paddingTop: 12 }}>
-                {[{ l: "Oil Temp", v: res.oilTemp, r: 30, u: "°C" }, { l: "Fuel Flow", v: res.fuelFlow, r: 3, u: " L/h" }].map(({ l, v, r, u }) => {
-                  const pct = Math.max(-1, Math.min(1, v / r)), c = Math.abs(pct) > 0.6 ? "#ef4444" : Math.abs(pct) > 0.3 ? "#f59e0b" : "#22c55e", bw = Math.abs(pct) * 50;
-                  return (
-                    <div key={l} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678", width: 56, textAlign: "right" }}>{l}</span>
-                      <div style={{ flex: 1, height: 14, background: "#080c10", border: "1px solid #1e2d3d", position: "relative", display: "flex", alignItems: "center" }}>
-                        <div style={{ position: "absolute", left: "50%", width: 1, height: "100%", background: "#1e2d3d" }} />
-                        <div style={{ position: "absolute", height: 8, width: `${bw}%`, left: pct >= 0 ? "50%" : `${50 - bw}%`, background: c, opacity: 0.8, transition: "all 0.4s" }} />
+        {/* ══════════════════════════════════════════════════════════════════
+            TAB: MULTI-MODEL FUSION & AI
+        ══════════════════════════════════════════════════════════════════ */}
+        {activeTab === "diagnostics" && (
+          <div style={{ display: "grid", gridTemplateColumns: "7fr 5fr", gap: 12 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10, borderBottom: "1px solid #1e2d3d", paddingBottom: 6 }}>
+                  <span style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#38bdf8" }}>
+                    MULTI-MODEL ENGINE DIAGNOSTICS
+                  </span>
+                  <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b" }}>5 INDEPENDENT AI INFERENCES</span>
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {aiModels.map((m) => (
+                    <div
+                      key={m.name}
+                      style={{
+                        background: "#080c10",
+                        border: "1px solid #182230",
+                        padding: "8px 10px",
+                        display: "grid",
+                        gridTemplateColumns: "1.4fr 2.5fr 0.8fr 0.8fr",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontFamily: "Rajdhani, sans-serif", fontWeight: 700, fontSize: 12, color: "#f8fafc" }}>{m.name}</div>
+                        <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>{m.domain}</div>
                       </div>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: c, width: 52 }}>{v >= 0 ? "+" : ""}{v.toFixed(2)}{u}</span>
+                      <div>
+                        <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: m.status !== "NOMINAL" ? "#fbbf24" : "#94a3b8" }}>
+                          {m.prediction}
+                        </div>
+                        <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#475569" }}>Params: {m.parameters}</div>
+                      </div>
+                      <div>
+                        <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 11, fontWeight: 700, color: "#f8fafc" }}>{m.confidence}%</div>
+                        <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#475569" }}>CONFIDENCE</div>
+                      </div>
+                      <div style={{ textAlign: "right" }}>
+                        <span style={{ padding: "2px 6px", fontSize: 9, fontFamily: "JetBrains Mono, monospace", fontWeight: 700, background: m.status === "NOMINAL" ? "#22c55e20" : "#f59e0b20", color: m.status === "NOMINAL" ? "#22c55e" : "#f59e0b", border: `1px solid ${m.status === "NOMINAL" ? "#22c55e" : "#f59e0b"}` }}>
+                          {m.status}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Central Intelligent Fusion Engine */}
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12, flex: 1, display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e2d3d", paddingBottom: 6 }}>
+                  <span style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#f59e0b" }}>
+                    INTELLIGENT FUSION ENGINE
+                  </span>
+                  <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#22c55e" }}>● BAYESIAN HARMONIZATION</span>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, textAlign: "center" }}>
+                  <div style={{ background: "#090d14", border: "1px solid #1e293b", padding: "6px 8px" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>AI ENSEMBLE WEIGHT</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 13, fontWeight: 700, color: "#38bdf8" }}>94.2%</div>
+                  </div>
+                  <div style={{ background: "#090d14", border: "1px solid #1e293b", padding: "6px 8px" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>PHYSICS MODEL MATCH</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 13, fontWeight: 700, color: "#f59e0b" }}>{physicsScore}%</div>
+                  </div>
+                  <div style={{ background: "#090d14", border: "1px solid #1e293b", padding: "6px 8px" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>SENSOR CONFIDENCE</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 13, fontWeight: 700, color: "#22c55e" }}>{stateConfidence}%</div>
+                  </div>
+                </div>
+
+                <div style={{ background: "rgba(245, 158, 11, 0.08)", border: "1px solid #f59e0b", padding: "12px 14px", marginTop: "auto" }}>
+                  <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#f59e0b", fontWeight: 700, letterSpacing: "0.2em" }}>
+                    DIGITAL TWIN CONSOLIDATED DIAGNOSIS:
+                  </div>
+                  <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 20, fontWeight: 800, color: "#fbbf24" }}>
+                    {scenario === "combustion_degradation" ? "PROBABLE INJECTOR DEGRADATION — 93% CONFIDENCE" : scenario === "sensor_fault" ? "PHYSICAL INCONSISTENCY — SENSOR DEFECT DETECTED" : "NOMINAL PROPULSION HEALTH — 98% CONFIDENCE"}
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
+            {/* Right Column: Mini Physics Validation & RUL */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12 }}>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#38bdf8", marginBottom: 10, borderBottom: "1px solid #1e2d3d", paddingBottom: 6 }}>
+                  PHYSICS VALIDATION RESIDUAL
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                  <div style={{ background: "#080c10", padding: "8px", border: "1px solid #182230" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>EXP EFF</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 15, fontWeight: 700, color: "#fff" }}>{base.expectedCombustionEff}%</div>
+                  </div>
+                  <div style={{ background: "#080c10", padding: "8px", border: "1px solid #182230" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>OBS EFF</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 15, fontWeight: 700, color: "#fbbf24" }}>{base.observedCombustionEff}%</div>
+                  </div>
+                  <div style={{ background: "#080c10", padding: "8px", border: "1px solid #182230" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>RESIDUAL</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 15, fontWeight: 700, color: base.efficiencyResidual > 1 ? "#ef4444" : "#22c55e" }}>+{base.efficiencyResidual}%</div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 12, flex: 1 }}>
+                <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.15em", color: "#38bdf8", marginBottom: 10, borderBottom: "1px solid #1e2d3d", paddingBottom: 6 }}>
+                  PROPULSION HEALTH INDEX & RISK
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div style={{ background: "#080c10", padding: "10px", border: "1px solid #182230" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>HEALTH INDEX</div>
+                    <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 28, fontWeight: 800, color: scenario === "combustion_degradation" ? "#ef4444" : "#22c55e" }}>
+                      {scenario === "combustion_degradation" ? "68" : "94"}<span style={{ fontSize: 14, color: "#64748b" }}>/100</span>
+                    </div>
+                  </div>
+                  <div style={{ background: "#080c10", padding: "10px", border: "1px solid #182230" }}>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 8, color: "#64748b" }}>RUL PROJECTION</div>
+                    <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 28, fontWeight: 800, color: "#38bdf8" }}>
+                      {scenario === "combustion_degradation" ? "48.5" : "264"}<span style={{ fontSize: 12, color: "#64748b" }}> HRS</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════════
+            TAB: EICAS & FAULT LOG
+        ══════════════════════════════════════════════════════════════════ */}
+        {activeTab === "eicas" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+              {[
+                { title: "WARNING", count: 0, desc: "Immediate Action Required", border: "#ef4444", active: false },
+                { title: "CAUTION", count: scenario === "nominal" ? 0 : 1, desc: "Crew Awareness Required", border: "#f59e0b", active: scenario !== "nominal" },
+                { title: "ADVISORY", count: 1, desc: "Crew Information", border: "#38bdf8", active: true },
+                { title: "STATUS", count: 2, desc: "Equipment Nominal State", border: "#22c55e", active: true },
+              ].map((tier) => (
+                <div key={tier.title} style={{ background: tier.active ? `${tier.border}15` : "#0c131e", border: `1px solid ${tier.border}${tier.active ? "99" : "33"}`, padding: "12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, color: tier.border }}>{tier.title}</div>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b" }}>{tier.desc}</div>
+                  </div>
+                  <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 32, fontWeight: 800, color: tier.border }}>{tier.count}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #1e2d3d", paddingBottom: 8, marginBottom: 10 }}>
+                <span style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 14, fontWeight: 700, color: "#38bdf8" }}>ACTIVE EICAS CREW ALERTS</span>
+                <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b" }}>STANAG 4586 AUDIT</span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {alerts.map((a) => {
+                  const alertColor = a.level === "WARNING" ? "#ef4444" : a.level === "CAUTION" ? "#f59e0b" : a.level === "ADVISORY" ? "#38bdf8" : "#22c55e";
+                  return (
+                    <div key={a.id} style={{ background: "#080c10", border: `1px solid ${alertColor}40`, borderLeft: `4px solid ${alertColor}`, padding: "10px 14px", display: "grid", gridTemplateColumns: "1.2fr 1.5fr 4fr 1fr 1.2fr", alignItems: "center", gap: 12 }}>
+                      <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 11, fontWeight: 700, color: alertColor }}>[{a.level}]</div>
+                      <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "#fff" }}>{a.code}</div>
+                      <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "#cbd5e1" }}>{a.message}</div>
+                      <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 9, color: "#64748b" }}>{a.time}</div>
+                      <div style={{ textAlign: "right" }}>
+                        <button onClick={() => setAlerts(alerts.map((it) => it.id === a.id ? { ...it, acknowledged: !it.acknowledged } : it))} style={{ background: a.acknowledged ? "#1e293b" : `${alertColor}20`, border: `1px solid ${a.acknowledged ? "#475569" : alertColor}`, color: a.acknowledged ? "#94a3b8" : alertColor, fontFamily: "JetBrains Mono, monospace", fontSize: 9, fontWeight: 700, padding: "4px 8px", cursor: "pointer" }}>
+                          {a.acknowledged ? "ACKNOWLEDGED" : "ACK ALERT"}
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
               </div>
             </div>
+          </div>
+        )}
 
-            <div style={{ gridColumn: "span 4", display: "flex", flexDirection: "column", gap: 12 }}>
-              <div style={{ background: "#0d1318", border: "1px solid #1e2d3d", padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase" }}>Anomaly Confidence</div>
-                {[
-                  { n: "Injector Clog C4", s: Math.round(deg.cyl4 * 100) },
-                  { n: "Cooling Restrict C2", s: Math.round(deg.cyl2 * 100) },
-                  { n: "Oil Seal Wear", s: Math.round(deg.oil * 100) },
-                  { n: "Vibration Drift", s: Math.round(Math.max(0,(tel.vibration-0.08)/0.22)*100) },
-                ].map(a => (
-                  <div key={a.n} style={{ border: `1px solid ${a.s > 30 ? "#f59e0b40" : "#1e2d3d"}`, background: a.s > 30 ? "rgba(245,158,11,0.04)" : "transparent", padding: "8px 10px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#8fa0b0" }}>{a.n}</span>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 700, color: a.s > 60 ? "#ef4444" : a.s > 30 ? "#f59e0b" : "#22c55e" }}>{a.s}%</span>
-                    </div>
-                    <div style={{ height: 3, background: "#080c10" }}>
-                      <div style={{ height: "100%", width: `${a.s}%`, background: a.s > 60 ? "#ef4444" : a.s > 30 ? "#f59e0b" : "#22c55e", transition: "width 0.5s" }} />
-                    </div>
-                  </div>
-                ))}
+        {/* ══════════════════════════════════════════════════════════════════
+            TAB: RAW TELEMETRY MATRIX
+        ══════════════════════════════════════════════════════════════════ */}
+        {activeTab === "telemetry" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ background: "#0c131e", border: "1px solid #1e2d3d", padding: 14 }}>
+              <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 13, fontWeight: 700, color: "#38bdf8", marginBottom: 10, borderBottom: "1px solid #1e2d3d", paddingBottom: 6 }}>
+                BOXER-4 CYLINDER TELEMETRY MATRIX
               </div>
-              <div style={{ background: "#0d1318", border: "1px solid #1e2d3d", padding: 16, flex: 1 }}>
-                <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase", marginBottom: 10 }}>ML Models</div>
-                {[["Autoencoder","12ms"],["Isolation Forest","8ms"],["LSTM-RUL","34ms"],["Physics Engine","2ms"]].map(([n,l]) => (
-                  <div key={n} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                      <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#22c55e", display: "inline-block" }} />
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#8fa0b0" }}>{n}</span>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+                {[0, 1, 2, 3].map((i) => (
+                  <div key={i} style={{ background: "#080c10", border: "1px solid #1e293b", padding: "10px" }}>
+                    <div style={{ fontFamily: "Rajdhani, sans-serif", fontSize: 14, fontWeight: 700, color: "#fff", marginBottom: 6 }}>
+                      CYLINDER #{i + 1}
                     </div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>{l}</span>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#22c55e" }}>ACTIVE</span>
+                    <div style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "#94a3b8", display: "flex", flexDirection: "column", gap: 4 }}>
+                      <div>CHT: <strong style={{ color: "#fff" }}>{Math.round(tel.cht[i])}°C</strong></div>
+                      <div>EGT: <strong style={{ color: tel.egt[i] > 850 ? "#ef4444" : "#fff" }}>{Math.round(tel.egt[i])}°C</strong></div>
+                      <div>Δ CHT: <span style={{ color: "#22c55e" }}>+{(tel.cht[i] - base.expectedCHT[i]).toFixed(1)}°C</span></div>
+                      <div>Δ EGT: <span style={{ color: Math.abs(tel.egt[i] - base.expectedEGT[i]) > 20 ? "#ef4444" : "#22c55e" }}>{(tel.egt[i] - base.expectedEGT[i]).toFixed(1)}°C</span></div>
                     </div>
                   </div>
                 ))}
@@ -356,107 +950,25 @@ export default function GCSDashboard() {
           </div>
         )}
 
-        {tab === "prognosis" && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(12,1fr)", gap: 12 }}>
-            <div style={{ gridColumn: "span 5", background: "#0d1318", border: "1px solid #1e2d3d", padding: 20 }}>
-              <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase", marginBottom: 14 }}>Health Index Breakdown</div>
-              {[
-                { label: "Overall Engine HI", val: hi.overall },
-                { label: "Cylinder 1", val: hi.cylinder[0] },
-                { label: "Cylinder 2", val: hi.cylinder[1] },
-                { label: "Cylinder 3", val: hi.cylinder[2] },
-                { label: "Cylinder 4", val: hi.cylinder[3] },
-                { label: "Lubrication", val: hi.lubrication },
-                { label: "Combustion", val: hi.combustion },
-                { label: "Thermal Mgmt", val: hi.thermal },
-              ].map(({ label, val }) => {
-                const c = val > 75 ? "#22c55e" : val > 50 ? "#f59e0b" : "#ef4444";
-                return (
-                  <div key={label} style={{ marginBottom: 14 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                      <span style={{ fontFamily: "Rajdhani", fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: "#8fa0b0" }}>{label}</span>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 11, fontWeight: 700, color: c }}>{val}%</span>
-                    </div>
-                    <div style={{ height: 4, background: "#0d1318", border: "1px solid #1e2d3d" }}>
-                      <div style={{ height: "100%", width: `${val}%`, background: c, boxShadow: `0 0 6px ${c}50`, transition: "width 0.5s, background 0.5s" }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div style={{ gridColumn: "span 7", display: "flex", flexDirection: "column", gap: 12 }}>
-              <div style={{ background: "#0d1318", border: "1px solid #1e2d3d", padding: 20 }}>
-                <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase", marginBottom: 12 }}>Remaining Useful Life Projection</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 16 }}>
-                  {[
-                    { label: "RUL Estimate", val: `${hi.rulHours}`, unit: "flight hours", c: "#f59e0b" },
-                    { label: "Confidence", val: "87.4%", unit: "LSTM survival", c: "#fff" },
-                    { label: "CBM Action", val: hi.rulHours < 60 ? "IMMEDIATE" : hi.rulHours < 120 ? "SCHEDULE" : "ROUTINE", unit: "maintenance trigger", c: hi.rulHours < 60 ? "#ef4444" : hi.rulHours < 120 ? "#f59e0b" : "#22c55e" },
-                  ].map(({ label, val, unit, c }) => (
-                    <div key={label}>
-                      <div style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678", marginBottom: 4 }}>{label}</div>
-                      <div style={{ fontFamily: "Rajdhani", fontSize: 28, fontWeight: 700, color: c, textShadow: `0 0 16px ${c}40`, lineHeight: 1 }}>{val}</div>
-                      <div style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678", marginTop: 2 }}>{unit}</div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{ height: 20, background: "#080c10", border: "1px solid #1e2d3d", position: "relative", overflow: "hidden" }}>
-                  <div style={{ position: "absolute", inset: 0, display: "flex" }}>
-                    <div style={{ width: "21.4%", background: "rgba(239,68,68,0.2)" }} />
-                    <div style={{ width: "21.4%", background: "rgba(245,158,11,0.2)" }} />
-                    <div style={{ flex: 1, background: "rgba(34,197,94,0.08)" }} />
-                  </div>
-                  <div style={{ position: "absolute", inset: 0, left: 0, width: `${(hi.rulHours / 280) * 100}%`, borderRight: "2px solid #f59e0b", transition: "width 0.5s" }} />
-                  <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", padding: "0 8px" }}>
-                    <span style={{ fontFamily: "JetBrains Mono", fontSize: 8, color: "#556678" }}>0 hr — CBM — WARN — CURRENT {hi.rulHours}h — 280h TBO</span>
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                {[{ label: "RPM Trend", val: tel.rpm, unit: "rpm", data: rpmH, color: "#f59e0b" }, { label: "Health Index", val: `${hi.overall}%`, unit: "", data: hiH, color: "#22c55e" }].map(({ label, val, unit, data, color }) => (
-                  <div key={label} style={{ background: "#0d1318", border: "1px solid #1e2d3d", padding: 14 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                      <span style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.15em", textTransform: "uppercase", color: "#8fa0b0" }}>{label}</span>
-                      <span style={{ fontFamily: "JetBrains Mono", fontSize: 10, fontWeight: 600, color }}>{val} {unit}</span>
-                    </div>
-                    <div style={{ borderBottom: "1px solid #1e2d3d" }}>
-                      <MiniChart data={data} color={color} h={40} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div style={{ background: "#0d1318", border: "1px solid #1e2d3d", padding: 14 }}>
-                <div style={{ fontFamily: "Rajdhani", fontSize: 10, letterSpacing: "0.2em", color: "#8fa0b0", textTransform: "uppercase", marginBottom: 10 }}>CBM Maintenance Schedule</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", border: "1px solid #1e2d3d" }}>
-                  {["Component","Status","RUL","Action"].map(h => (
-                    <div key={h} style={{ fontFamily: "Rajdhani", fontSize: 9, letterSpacing: "0.15em", textTransform: "uppercase", color: "#556678", padding: "6px 8px", background: "#080c10", borderBottom: "1px solid #1e2d3d" }}>{h}</div>
-                  ))}
-                  {[
-                    ["CYL 2 Cooling Duct", deg.cyl2 > 0.5 ? "DEGRADED" : "WATCH", `${Math.round((1-deg.cyl2)*120)} hr`, deg.cyl2 > 0.5 ? "INSPECT" : "MONITOR"],
-                    ["Oil System Seals", deg.oil > 0.4 ? "CAUTION" : "NOMINAL", `${Math.round((1-deg.oil)*180)} hr`, deg.oil > 0.4 ? "SCHEDULE" : "ROUTINE"],
-                    ["CYL 4 Injector", deg.cyl4 > 0.3 ? "WATCH" : "NOMINAL", `${Math.round((1-deg.cyl4)*200)} hr`, "MONITOR"],
-                    ["Spark Plugs (all)", "NOMINAL", "240 hr", "ROUTINE"],
-                  ].map(([comp,stat,rul,action], i) => {
-                    const c = stat === "DEGRADED" ? "#ef4444" : stat === "CAUTION" || stat === "WATCH" ? "#f59e0b" : "#22c55e";
-                    return [comp,stat,rul,action].map((cell,j) => (
-                      <div key={`${i}-${j}`} style={{ fontFamily: "JetBrains Mono", fontSize: 9, padding: "6px 8px", borderBottom: "1px solid #1e2d3d", color: j===1 ? c : "#8fa0b0" }}>{cell}</div>
-                    ));
-                  })}
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
 
-      {/* Footer */}
-      <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 20px", borderTop: "1px solid #1e2d3d", background: "#080c10", flexShrink: 0 }}>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>CAN 2.0B · J1939 · FADEC · SocketCAN · STANAG-4586</span>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>EDGE: JETSON-NX · 12ms · STREAM OK</span>
-        <span style={{ fontFamily: "JetBrains Mono", fontSize: 9, color: "#556678" }}>AeroDTwin GCS v2.4.1 © 2026 · UNCLASSIFIED // FOUO</span>
+      {/* ─── Footer ───────────────────────────────────────────────────── */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          padding: "4px 18px",
+          borderTop: "1px solid #1e2d3d",
+          background: "#080c10",
+          fontFamily: "JetBrains Mono, monospace",
+          fontSize: 9,
+          color: "#475569",
+          flexShrink: 0,
+        }}
+      >
+        <span>PHYSICS ENGINE: 0D MEAN-VALUE THERMODYNAMICS (50 Hz CYCLE)</span>
+        <span>EDGE ACCELERATOR: JETSON ORIN NX (LATENCY: 8.4ms)</span>
+        <span>SECURITY: UNCLASSIFIED // NATO STANAG-4586 COMPLIANT</span>
       </div>
     </div>
   );

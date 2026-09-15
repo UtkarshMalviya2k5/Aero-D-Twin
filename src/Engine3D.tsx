@@ -1,9 +1,9 @@
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 
-const MODEL_3D_PATH = "/models/AeroDTwin_Rotax_20_Compounds.gltf";
+const MODEL_3D_PATH = "/models/AeroDTwin_Rotax_20_Compounds.glb";
 
 type ComponentInfo = {
   id: string;
@@ -46,15 +46,11 @@ function statusColor(status: ComponentInfo["status"]) {
 
 function EngineModel({
   selected,
-  hovered,
   onSelect,
-  onHover,
   controlsRef,
 }: {
   selected: string | null;
-  hovered: string | null;
   onSelect: (id: string | null) => void;
-  onHover: (id: string | null) => void;
   controlsRef: React.RefObject<any>;
 }) {
   const { scene } = useGLTF(MODEL_3D_PATH);
@@ -64,52 +60,32 @@ function EngineModel({
   const meshes = useMemo(() => {
     const result: THREE.Mesh[] = [];
     scene.traverse((obj: THREE.Object3D) => {
-      if ((obj as THREE.Mesh).isMesh) result.push(obj as THREE.Mesh);
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh;
+        // Optimize mesh memory
+        mesh.frustumCulled = true;
+        result.push(mesh);
+      }
     });
     return result;
   }, [scene]);
 
-  // Prepare every mesh for independent highlighting and divide the model
-  // into 20 interactive component buckets.
+  // Assign component IDs once
   useEffect(() => {
     meshes.forEach((mesh, index) => {
-      const componentId = String((index % 20) + 1).padStart(2, "0");
-      mesh.userData.componentId = componentId;
-
-      // Clone materials so highlighting one component cannot recolor
-      // another component that happens to share the same GLTF material.
-      if (Array.isArray(mesh.material)) {
-        mesh.material = mesh.material.map((material: THREE.Material) => {
-          const cloned = material.clone() as THREE.MeshStandardMaterial;
-          cloned.userData.originalColor = cloned.color
-            ? cloned.color.clone()
-            : new THREE.Color("#8a93a3");
-          cloned.userData.originalEmissive = cloned.emissive
-            ? cloned.emissive.clone()
-            : new THREE.Color("#000000");
-          cloned.userData.originalEmissiveIntensity =
-            cloned.emissiveIntensity ?? 0;
-          return cloned;
-        });
-      } else if (mesh.material) {
-        const cloned = mesh.material.clone() as THREE.MeshStandardMaterial;
-        cloned.userData.originalColor = cloned.color
-          ? cloned.color.clone()
-          : new THREE.Color("#8a93a3");
-        cloned.userData.originalEmissive = cloned.emissive
-          ? cloned.emissive.clone()
-          : new THREE.Color("#000000");
-        cloned.userData.originalEmissiveIntensity =
-          cloned.emissiveIntensity ?? 0;
-        mesh.material = cloned;
-      }
+      mesh.userData.componentId = String((index % 20) + 1).padStart(2, "0");
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      materials.forEach((m: any) => {
+        if (!m.userData.origColor) {
+          m.userData.origColor = m.color ? m.color.clone() : new THREE.Color("#8a93a3");
+        }
+      });
     });
   }, [meshes]);
 
-  // Automatically center and scale the engine so it fills the viewer.
+  // Center & auto-fit
   useEffect(() => {
     if (!modelRef.current) return;
-
     const box = new THREE.Box3().setFromObject(scene);
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
@@ -117,54 +93,30 @@ function EngineModel({
 
     if (!isFinite(maxDimension) || maxDimension <= 0) return;
 
-    const targetSize = 5.2;
-    const scale = targetSize / maxDimension;
-
+    const scale = 5.2 / maxDimension;
     scene.position.sub(center);
     scene.scale.setScalar(scale);
 
-    requestAnimationFrame(() => {
-      controlsRef.current?.target.set(0, 0, 0);
-      controlsRef.current?.update();
-    });
+    controlsRef.current?.target.set(0, 0, 0);
+    controlsRef.current?.update();
   }, [scene, controlsRef]);
 
-  useFrame(() => {
+  // Re-color ONLY the selected mesh instead of looping through all meshes
+  useEffect(() => {
     meshes.forEach((mesh) => {
-      const id = mesh.userData.componentId;
-      const isSelected = selected === id;
-      const isHovered = hovered === id;
-
-      const materials = Array.isArray(mesh.material)
-        ? mesh.material
-        : [mesh.material];
-
-      materials.forEach((material: any) => {
-        if (!material.color) return;
-
-        const originalColor =
-          material.userData.originalColor || new THREE.Color("#8a93a3");
-        const originalEmissive =
-          material.userData.originalEmissive || new THREE.Color("#000000");
-
-        if (isSelected) {
-          material.color.set("#d8c77a");
-          if (material.emissive) material.emissive.set("#8d7b32");
-          material.emissiveIntensity = 0.22;
-          material.metalness = Math.max(material.metalness ?? 0, 0.35);
-        } else if (isHovered) {
-          material.color.set("#f0eee5");
-          if (material.emissive) material.emissive.set("#8f8a72");
-          material.emissiveIntensity = 0.10;
-        } else {
-          material.color.copy(originalColor);
-          if (material.emissive) material.emissive.copy(originalEmissive);
-          material.emissiveIntensity =
-            material.userData.originalEmissiveIntensity ?? 0;
+      const isSelected = selected === mesh.userData.componentId;
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      materials.forEach((m: any) => {
+        if (m.color && m.userData.origColor) {
+          if (isSelected) {
+            m.color.set("#d8c77a");
+          } else {
+            m.color.copy(m.userData.origColor);
+          }
         }
       });
     });
-  });
+  }, [selected, meshes]);
 
   const focusObject = (object: THREE.Object3D) => {
     const box = new THREE.Box3().setFromObject(object);
@@ -172,12 +124,7 @@ function EngineModel({
     const size = box.getSize(new THREE.Vector3());
     const distance = Math.max(size.length() * 2.2, 1.8);
 
-    camera.position.set(
-      center.x + distance,
-      center.y + distance * 0.65,
-      center.z + distance
-    );
-
+    camera.position.set(center.x + distance, center.y + distance * 0.65, center.z + distance);
     controlsRef.current?.target.copy(center);
     controlsRef.current?.update();
   };
@@ -200,59 +147,28 @@ function EngineModel({
         }
       }}
     >
-      <primitive
-        object={scene}
-        onPointerOver={(e: any) => {
-          e.stopPropagation();
-          const id = e.object?.userData?.componentId;
-          if (id) onHover(id || null);
-          document.body.style.cursor = "pointer";
-        }}
-        onPointerOut={() => {
-          onHover(null);
-          document.body.style.cursor = "default";
-        }}
-      />
+      <primitive object={scene} />
     </group>
   );
 }
 
 export default function Engine3D() {
   const [selected, setSelected] = useState<string | null>(null);
-  const [hovered, setHovered] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [showList, setShowList] = useState(true);
   const [showInfo, setShowInfo] = useState(true);
   const [visible, setVisible] = useState(true);
   const controlsRef = useRef<any>(null);
 
-  const selectedInfo =
-    healthData.find((item) => item.id === selected) || null;
-
-  const filtered = healthData.filter((item) =>
-    item.name.toLowerCase().includes(search.toLowerCase())
-  );
+  const selectedInfo = healthData.find((item) => item.id === selected) || null;
+  const filtered = healthData.filter((item) => item.name.toLowerCase().includes(search.toLowerCase()));
 
   const resetView = () => {
     controlsRef.current?.target.set(0, 0, 0);
     controlsRef.current?.object.position.set(5.5, 3.6, 5.5);
     controlsRef.current?.update();
     setSelected(null);
-    setHovered(null);
   };
-
-  useEffect(() => {
-    const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setSelected(null);
-        setHovered(null);
-      }
-      if (e.key.toLowerCase() === "r") resetView();
-    };
-
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  }, []);
 
   return (
     <div
@@ -261,34 +177,31 @@ export default function Engine3D() {
         height: "100%",
         position: "relative",
         overflow: "hidden",
-        background:
-          "radial-gradient(circle at 50% 45%, #20231f 0%, #111310 55%, #090a09 100%)",
+        background: "radial-gradient(circle at 50% 45%, #20231f 0%, #111310 55%, #090a09 100%)",
         color: "#e8e6dc",
         fontFamily: "Arial, sans-serif",
       }}
     >
       <Canvas
-        camera={{ position: [5.5, 3.6, 5.5], fov: 42, near: 0.01, far: 1000 }}
+        camera={{ position: [5.5, 3.6, 5.5], fov: 42, near: 0.1, far: 100 }}
         dpr={1}
-        gl={{ antialias: true, powerPreference: "high-performance" }}
+        performance={{ min: 0.5 }}
+        gl={{
+          antialias: false, // Turn off antialiasing for maximum iGPU FPS
+          powerPreference: "default",
+          precision: "mediump", // Cuts shader math load by half
+        }}
       >
-        <ambientLight intensity={2.1} />
-        <directionalLight position={[6, 8, 6]} intensity={2.4} />
-        <directionalLight position={[-6, 4, -5]} intensity={1.4} />
-        <pointLight position={[0, 2, 3]} intensity={0.65} color="#b7b29b" />
+        <ambientLight intensity={1.8} />
+        <directionalLight position={[6, 8, 6]} intensity={1.8} />
 
-        <gridHelper
-          args={[14, 28, "#3b3d36", "#242620"]}
-          position={[0, -3.0, 0]}
-        />
+        <gridHelper args={[14, 28, "#3b3d36", "#242620"]} position={[0, -3.0, 0]} />
 
         <Suspense fallback={null}>
           {visible && (
             <EngineModel
               selected={selected}
-              hovered={hovered}
               onSelect={setSelected}
-              onHover={setHovered}
               controlsRef={controlsRef}
             />
           )}
@@ -296,8 +209,7 @@ export default function Engine3D() {
 
         <OrbitControls
           ref={controlsRef}
-          enableDamping
-          dampingFactor={0.08}
+          enableDamping={false} // Disabling damping eliminates idle rendering loop lag
           minDistance={1.5}
           maxDistance={15}
           enablePan
@@ -333,30 +245,8 @@ export default function Engine3D() {
 
         <div style={{ display: "flex", gap: 18, alignItems: "center" }}>
           <div style={{ fontSize: 11, opacity: 0.7 }}>20 COMPONENT REGISTER</div>
-          <div style={{ fontSize: 11, color: "#a8b08a" }}>
-            ● SYSTEM STATUS: NOMINAL
-          </div>
+          <div style={{ fontSize: 11, color: "#a8b08a" }}>● SYSTEM STATUS: NOMINAL</div>
         </div>
-      </div>
-
-      {/* Engineering mode indicator */}
-      <div
-        style={{
-          position: "absolute",
-          top: 76,
-          left: "50%",
-          transform: "translateX(-50%)",
-          padding: "5px 10px",
-          background: "rgba(18,20,17,.92)",
-          border: "1px solid rgba(201,180,88,.32)",
-          color: "#c9b458",
-          fontSize: 9,
-          letterSpacing: 1.2,
-          fontWeight: 700,
-          pointerEvents: "none",
-        }}
-      >
-        ENGINEERING INSPECTION MODE
       </div>
 
       {/* Left component browser */}
@@ -377,9 +267,7 @@ export default function Engine3D() {
           }}
         >
           <div style={{ padding: 13, borderBottom: "1px solid rgba(220,218,205,.08)" }}>
-            <div style={{ fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>
-              COMPONENT REGISTER
-            </div>
+            <div style={{ fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>COMPONENT REGISTER</div>
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
@@ -412,10 +300,7 @@ export default function Engine3D() {
                   padding: "9px 12px",
                   border: 0,
                   borderBottom: "1px solid rgba(220,218,205,.045)",
-                  background:
-                    selected === item.id
-                      ? "rgba(201,180,88,.12)"
-                      : "transparent",
+                  background: selected === item.id ? "rgba(201,180,88,.12)" : "transparent",
                   color: "white",
                   textAlign: "left",
                   cursor: "pointer",
@@ -455,12 +340,8 @@ export default function Engine3D() {
             boxShadow: "0 8px 24px rgba(0,0,0,.28)",
           }}
         >
-          <div style={{ fontSize: 9, opacity: 0.5, letterSpacing: 1.5 }}>
-            COMPONENT ASSESSMENT
-          </div>
-          <div style={{ marginTop: 5, fontSize: 19, fontWeight: 800 }}>
-            {selectedInfo.name}
-          </div>
+          <div style={{ fontSize: 9, opacity: 0.5, letterSpacing: 1.5 }}>COMPONENT ASSESSMENT</div>
+          <div style={{ marginTop: 5, fontSize: 19, fontWeight: 800 }}>{selectedInfo.name}</div>
 
           <div
             style={{
@@ -477,12 +358,8 @@ export default function Engine3D() {
             ● {selectedInfo.status}
           </div>
 
-          <div style={{ marginTop: 15, fontSize: 10, opacity: 0.55 }}>
-            CONDITION ASSESSMENT
-          </div>
-          <div style={{ marginTop: 5, fontSize: 29, fontWeight: 800 }}>
-            {selectedInfo.health}%
-          </div>
+          <div style={{ marginTop: 15, fontSize: 10, opacity: 0.55 }}>CONDITION ASSESSMENT</div>
+          <div style={{ marginTop: 5, fontSize: 29, fontWeight: 800 }}>{selectedInfo.health}%</div>
 
           <div
             style={{
@@ -502,31 +379,15 @@ export default function Engine3D() {
             />
           </div>
 
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1fr 1fr 1fr",
-              gap: 7,
-              marginTop: 15,
-            }}
-          >
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 7, marginTop: 15 }}>
             {[
               ["TEMP", `${selectedInfo.temperature}°C`],
               ["VIB", `${selectedInfo.vibration} mm/s`],
               ["PRESS", `${selectedInfo.pressure} bar`],
             ].map(([label, value]) => (
-              <div
-                key={label}
-                style={{
-                  padding: 8,
-                  borderRadius: 2,
-                  background: "rgba(220,218,205,.045)",
-                }}
-              >
+              <div key={label} style={{ padding: 8, borderRadius: 2, background: "rgba(220,218,205,.045)" }}>
                 <div style={{ fontSize: 8, opacity: 0.5 }}>{label}</div>
-                <div style={{ marginTop: 5, fontSize: 11, fontWeight: 700 }}>
-                  {value}
-                </div>
+                <div style={{ marginTop: 5, fontSize: 11, fontWeight: 700 }}>{value}</div>
               </div>
             ))}
           </div>
@@ -591,39 +452,6 @@ export default function Engine3D() {
           </button>
         ))}
       </div>
-
-      <div
-        style={{
-          position: "absolute",
-          bottom: 19,
-          right: 16,
-          fontSize: 9,
-          opacity: 0.45,
-          pointerEvents: "none",
-        }}
-      >
-        CLICK: ASSESS • DOUBLE-CLICK: FOCUS • R: RESET • ESC: CLEAR
-      </div>
-
-      {!selected && (
-        <div
-          style={{
-            position: "absolute",
-            left: "50%",
-            top: 78,
-            transform: "translateX(-50%)",
-            padding: "7px 12px",
-            borderRadius: 2,
-            background: "rgba(22,24,21,.72)",
-            border: "1px solid rgba(201,180,88,.16)",
-            fontSize: 10,
-            opacity: 0.7,
-            pointerEvents: "none",
-          }}
-        >
-          SELECT COMPONENT FOR ASSESSMENT
-        </div>
-      )}
     </div>
   );
 }

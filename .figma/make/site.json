@@ -1,0 +1,10 @@
+{
+  "description": "Monitors piston-engine UAVs in real-time using physics and AI to predict failures, optimize maintenance, and enhance mission readiness with live analytics.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
